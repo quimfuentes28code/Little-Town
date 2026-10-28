@@ -111,3 +111,127 @@ test('speed multiplies simulation time and invalid elapsed times are ignored', (
   sim.setSpeed(999);
   assert.equal(sim.state.speed, 4);
 });
+
+test('save round trips preserve clocks, resources, events and future migration exactly', () => {
+  const original = createSimulation();
+  original.build('farm');
+  original.build('house');
+  advance(original, 58);
+  original.update(0.375);
+  original.setSpeed(2);
+  const checkpoint = JSON.parse(JSON.stringify(original.exportSave()));
+  const restored = createSimulation();
+  const reference = restored.state;
+  assert.equal(restored.importSave(checkpoint).ok, true);
+  assert.equal(restored.state, reference, 'UI keeps the same state object');
+  assert.deepEqual(restored.state, original.state);
+  assert.deepEqual(restored.exportSave(), checkpoint);
+  advance(original, 83);
+  advance(restored, 83);
+  assert.deepEqual(restored.state, original.state, 'migration and seasons resume at the same sub-second');
+  assert.deepEqual(restored.exportSave(), original.exportSave());
+  checkpoint.state.buildings.house += 10;
+  assert.notEqual(restored.state.buildings.house, checkpoint.state.buildings.house, 'caller cannot mutate restored state');
+});
+
+test('save preserves partial hunger clocks and paused games without offline catchup', () => {
+  const original = createSimulation();
+  advance(original, 135);
+  // Reset food during winter, whose production cannot meet consumption.
+  original.state.food = 0;
+  advance(original, 9);
+  const checkpoint = original.exportSave();
+  assert.ok(checkpoint.clocks.hunger > 0);
+  original.togglePause();
+  const pausedCheckpoint = original.exportSave();
+  const restored = createSimulation();
+  assert.equal(restored.importSave(pausedCheckpoint).ok, true);
+  advance(restored, 10000);
+  assert.deepEqual(restored.exportSave(), pausedCheckpoint);
+  restored.togglePause();
+  original.togglePause();
+  advance(original, 11);
+  advance(restored, 11);
+  assert.deepEqual(restored.exportSave(), original.exportSave());
+});
+
+test('malformed saves are rejected transactionally, including hidden clocks and unknown fields', () => {
+  const sim = createSimulation();
+  sim.build('farm');
+  advance(sim, 43);
+  const before = sim.exportSave();
+  const stateBefore = structuredClone(sim.state);
+  const mutations = [
+    save => { save.version = 999; },
+    save => { delete save.state; },
+    save => { save.extra = true; },
+    save => { save.state.food = -1; },
+    save => { save.state.wood = NaN; },
+    save => { save.state.stone = Infinity; },
+    save => { save.state.happiness = 100; },
+    save => { save.state.population = 1000; },
+    save => { save.state.speed = 3; },
+    save => { save.state.paused = 'false'; },
+    save => { save.state.selected = 'toString'; },
+    save => { save.state.buildings.house = 6.2; },
+    save => { save.state.buildings.house = 5; },
+    save => { save.state.buildings.castle = 1; },
+    save => { delete save.state.buildings.farm; },
+    save => { save.clocks.elapsed = -1; },
+    save => { save.clocks.elapsed = Infinity; },
+    save => { save.clocks.migration = 20; },
+    save => { save.clocks.hunger = 18; },
+    save => { save.progress.peakPopulation = 0; },
+    save => { save.progress.winterSurvived = true; },
+    save => { save.events[0].text = null; },
+    save => { save.events[0].kind = 'script'; },
+    save => { save.events[0].id = save.eventSequence + 1; },
+    save => { save.events.push(...Array(10).fill(save.events[0])); },
+  ];
+  for (const mutate of mutations) {
+    const bad = structuredClone(before);
+    mutate(bad);
+    assert.equal(sim.importSave(bad).ok, false);
+    assert.deepEqual(sim.state, stateBefore);
+    assert.deepEqual(sim.exportSave(), before);
+  }
+  for (const bad of [null, undefined, [], true, '{}', new Date()]) {
+    assert.equal(sim.importSave(bad).ok, false);
+    assert.deepEqual(sim.exportSave(), before);
+  }
+});
+
+test('objectives follow real building, population and winter progress without repeated rewards', () => {
+  const sim = createSimulation();
+  const objective = id => sim.state.objectives.find(goal => goal.id === id);
+  assert.equal(sim.state.objectives.length, 4);
+  assert.ok(sim.state.objectives.every(goal => !goal.complete));
+  assert.equal(objective('community').progress, 24);
+  assert.equal(sim.build('farm').ok, true);
+  assert.equal(objective('harvest').complete, true);
+  assert.equal(objective('home').complete, false);
+  assert.equal(sim.build('house').ok, true);
+  assert.equal(objective('home').complete, true);
+  advance(sim, 179);
+  assert.equal(objective('winter').complete, false);
+  sim.update(1);
+  assert.equal(objective('winter').complete, true);
+  advance(sim, 60);
+  assert.equal(objective('community').complete, true);
+  const before = sim.exportSave();
+  const resources = [sim.state.wood, sim.state.stone, sim.state.food];
+  for (let i = 0; i < 5; i++) assert.equal(sim.importSave(before).ok, true);
+  assert.deepEqual([sim.state.wood, sim.state.stone, sim.state.food], resources);
+  assert.deepEqual(sim.exportSave(), before, 'loading completed goals does not add events or rewards');
+  assert.ok(sim.state.events.length <= 6);
+  assert.ok(sim.state.events.every(event => ['info', 'success', 'warning'].includes(event.kind)));
+});
+
+test('inherited building names cannot corrupt resources or the saved game', () => {
+  const sim = createSimulation();
+  for (const type of ['constructor', 'toString', '__proto__', null, undefined]) {
+    const before = sim.exportSave();
+    assert.equal(sim.build(type).ok, false);
+    assert.deepEqual(sim.exportSave(), before);
+  }
+});
